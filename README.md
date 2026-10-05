@@ -30,7 +30,17 @@ Run the tests with:
 
 `fetch.rb` defaults to all sixteen upstream registries; pass names to limit (`ruby fetch.rb rubygems.org hex.pm`). HTTP responses are cached under `cache/<step>/` keyed by URL. `repos.rb`, `commits.rb` and `issues.rb` skip rows already synced; `advisories.rb` reprocesses cached responses on each run. These four enrichment scripts take an optional row limit.
 
-Pass `--refresh` to `fetch.rb`, `mydataset.rb`, `repos.rb`, `commits.rb`, `issues.rb` or `advisories.rb` to fetch fresh responses and replace their cache entries. For the repository, commit and issue collectors, this also revisits previously synced rows. For example, `ruby issues.rb --refresh 10` refreshes the first ten repositories. Rerun `classify.rb` and `report.rb` after refreshing the data. Advisory withdrawals are stored and excluded from advisory counts and `unpatched.csv`.
+Pass `--refresh` to `fetch.rb`, `mydataset.rb`, `repos.rb`, `commits.rb`, `issues.rb`, `advisories.rb`, `owners.rb`, `maintainers.rb`, `orgs.rb`, `emails.rb`, `clone.rb`, `deps.rb`, `dependents.rb` or `size.rb` to bypass saved responses and revisit previously collected rows. For example, `ruby issues.rb --refresh 10` refreshes the first ten repositories. Row limits and supported ecosystem and bucket filters still apply; `--refresh` does not imply `--all`. Advisory withdrawals are stored and excluded from advisory counts and `unpatched.csv`.
+
+Run `owners.rb` before `maintainers.rb`, `orgs.rb` or `emails.rb`. Owner refreshes fetch directly from the repository service instead of using embedded package caches. Email refreshes replace each selected user's email list and repeat DNS and WHOIS checks for all domains in the saved email lists; the row limit applies only to users. Failed refreshes preserve previous observations. Successful dependency and dependent refreshes replace their saved lists, removing entries absent from the new response.
+
+After collecting fresh data, rerun `classify.rb`, `situate.rb` and `report.rb` to update derived results and exports. `situate.rb` recomputes heuristic values on each run, preserves human and LLM decisions, and rejects `--refresh` because it has no fetch or cache to refresh.
+
+Package imports preserve repository fields once `repos.rb` has saved a source sync date. Refresh those fields through `repos.rb --refresh`; importing packages again updates package fields without replacing directly collected repository data.
+
+`mydataset.rb`, `repos.rb` and `owners.rb` save unresolved lookups in the selected database, with the package, repository or owner identity, endpoint, HTTP status and failure reason. Repository failures also include the GitHub status when checked. A later successful lookup clears its entry. Failed responses are not cached, and reruns retry recorded failures even when older metadata is present; legacy `null` cache entries are fetched again to establish their status.
+
+Pass `--failures FILE` to any of those three commands to export its unresolved lookups as CSV, for example `ruby repos.rb --failures out/repo-failures.csv`. The file is replaced on each export. `report.rb` writes all recorded failures to `out/lookup-failures.csv`, including package names associated with a failed repository. `repository_service_miss` means GitHub returned a repository page while the repository service returned 404; `repository_not_found` means both returned 404. A 404 can also mean a private or otherwise unavailable resource. Rate limits, server errors and timeouts have separate reasons, and unknown HTTP statuses remain blank.
 
 The signals stack as proofs of life: a recent release, a recent default-branch commit, an active issue maintainer or a merged PR is enough to mark a repo alive and skip the expensive checks. Run `classify.rb` between steps; `clone.rb` and `deps.rb` skip repos already bucketed `active` (pass `--all` to override). `clone.rb` does a `--depth 1 --bare --filter=blob:none` clone per repo to read the real default-branch HEAD date, since `pushed_at` from the API covers any branch and lags. `deps.rb` measures drift: for each package's latest release it fetches the declared direct dependencies, looks up each dep's current latest, and records `majors_behind`.
 
@@ -52,8 +62,23 @@ Use a separate database to restrict enrichment and classification to your list:
     ruby issues.rb
     ruby advisories.rb
     ruby classify.rb
+    ruby owners.rb
+    ruby maintainers.rb
+    ruby orgs.rb
+    ruby emails.rb
+    ruby clone.rb
+    ruby deps.rb
+    ruby dependents.rb
+    ruby size.rb
+    ruby classify.rb
+    ruby situate.rb
+    ruby report.rb
 
-This replaces the `fetch.rb` step. Running `fetch.rb` afterward also imports the critical-package collection. Without `BERNIES_DB`, the importer writes to `bernies.db`. `report.rb` also respects `BERNIES_DB`, defaulting to `bernies.db`; exports are written to the same `out/` and `findings/` paths regardless of the database selected.
+This replaces the `fetch.rb` step. Running `fetch.rb` afterward also imports the critical-package collection. All database commands use `BERNIES_DB`, including the remediation, tagging and domain follow-up scripts. Relative database paths are resolved against the scripts' directory. Run `owners.rb` before the maintainer, organisation and email collectors, and `deps.rb`, `dependents.rb` and `size.rb` before `situate.rb` and the remediation reports.
+
+Custom exports go beside the database: `mydataset.db.output/out/` contains reports and the tag review sheet, and `mydataset.db.output/findings/` contains per-ecosystem CSVs. For example, export with `ruby tag.rb`, then import edits with `ruby tag.rb --import mydataset.db.output/out/tag.csv` while `BERNIES_DB` remains set. Commands print their output paths. Explicit paths passed to `--import` or `--failures` are used as supplied.
+
+With the default `bernies.db`, exports still use the existing `out/` and `findings/` directories. Remote response caches remain shared; owner imports are restricted to the selected dataset, and cached LLM results require matching prompt inputs and model. Unset `BERNIES_DB` to return to the default dataset.
 
 The importer validates all rows before making requests or writing data. Duplicate entries are fetched once. Missing or unavailable packages are reported, valid packages are imported, and the command exits with a nonzero status if any lookup fails. Re-running updates existing entries without deleting packages omitted from the file. Responses are cached under `cache/mydataset`; use `ruby mydataset.rb --refresh ./mydata.txt` to fetch them again.
 
@@ -69,7 +94,7 @@ The importer validates all rows before making requests or writing data. Duplicat
     BERNIES_DB=science-bernies.db ruby classify.rb
     ruby report_science.rb
 
-The collector stores the science rank, score, citations, category and owner metadata, along with any packages published from the repository. The normal enrichment scripts then collect the same repository activity, maintainer response and advisory signals used for the package dataset. `report_science.rb` writes `out/science-projects.csv`, `out/science-bernies.csv` and `out/science-buckets.csv`.
+The collector stores the science rank, score, citations, category and owner metadata, along with any packages published from the repository. The normal enrichment scripts then collect the same repository activity, maintainer response and advisory signals used for the package dataset. With its default `science-bernies.db`, `report_science.rb` writes `out/science-projects.csv`, `out/science-bernies.csv` and `out/science-buckets.csv`. A different `BERNIES_DB` places these files in `<database>.output/out/` beside that database.
 
 The science API does not currently return `science_score` or allow API sorting by it, so cohort selection reads the public projects listing and fetches each selected project from the JSON API. Responses are cached under `cache/science`; remove that directory to collect a new ranking.
 
@@ -81,6 +106,10 @@ The science API does not currently return `science_score` or allow API sorting b
   * **unknown**: nobody filed anything and nothing happened; responsiveness is untested. Also covers repos the issues service hasn't indexed.
 
 `dead` is deliberately a hard claim: it requires evidence that someone knocked and nobody answered. Zero commits is never sufficient on its own; a finished package with no commits in five years whose author would still merge a security fix is dormant, not dead. Thresholds live at the top of `classify.rb` and the `signals` column on each repo records the raw inputs so cutoffs can be argued over with `SELECT` rather than re-collection.
+
+Archive status and rolling commit and issue counts support classification only when their source sync date is at most 365 days old. Missing, invalid or future sync dates also exclude those observations. The saved values remain available, and `signals` identifies excluded sources with entries such as `issues:stale` or `commits:missing`. Dated releases, pushes and individual commits still use the existing one-year activity window; without usable evidence, the result is `unknown`. Refreshing a response does not make its contents current if the service still returns an old sync date.
+
+The main, per-bucket and remediation reports include repository, commit and issue sync dates alongside `classified_at`. Remediation exports also include `signals`, so an `unknown` result can be checked against missing or stale observations.
 
 ## Remediation
 
@@ -94,7 +123,7 @@ Bucketing tells you whether anyone is home; remediation asks what a dependent sh
     ruby tag.rb --import out/tag.csv          # write reviewed rows back
     ruby report.rb                            # adds out/remediation.{csv,json}
 
-These follow the same pattern as the bucket pipeline: each script is idempotent, caches under `cache/<step>/`, takes an optional row limit, and skips `bucket='active'` by default. `--ecosystem NAME` restricts to one ecosystem; `--bucket NAME` targets a specific bucket (useful for spot-checking active repos for misclassification). `size.rb` needs `brief` and `scc` on PATH. `llm.rb` shells out to `claude -p` with a JSON schema, model overridable via `BERNIES_MODEL`. `dependents.rb` computes `transit_ratio` (sum of top-N dependents' downloads ÷ this package's downloads) as a direct-vs-transitive proxy, falling back to `dependent_repos_count` on registries without download data (go, maven, swiftpm).
+`dependents.rb` and `size.rb` cache results, take an optional row limit, and skip `bucket='active'` by default. Both accept `--refresh`, `--all` and `--ecosystem NAME`; `size.rb` also accepts `--bucket NAME` to target a specific bucket. `situate.rb` accepts only `--all`. `size.rb` needs `brief` and `scc` on PATH. `llm.rb` shells out to `claude -p` with a JSON schema, model overridable via `BERNIES_MODEL`. `dependents.rb` computes `transit_ratio` (sum of top-N dependents' downloads ÷ this package's downloads) as a direct-vs-transitive proxy, falling back to `dependent_repos_count` on registries without download data (go, maven, swiftpm).
 
 Each row carries `remediation_source` (heuristic / llm / human) so downstream consumers can weight it. `situate.rb` won't overwrite llm or human rows; `llm.rb` won't overwrite human rows. The intended output is developer-facing guidance, so high-blast-radius packages should pass through `tag.rb` review before being published.
 
@@ -107,6 +136,7 @@ Everything lands in `bernies.db` (sqlite, WAL mode):
   * `packages`: one row per critical package (purl). Registry, dependent counts, downloads, latest release, registry maintainers, dep-drift rollups, `top1_share`/`top5_share`/`transit_ratio`, `situation`/`remediation`/`alternative_purl`/`remediation_source`.
   * `repos`: one row per repository_url. Repo metadata, commit/issue stats, clone result, advisory rollups, bucket, signals, `code_loc`/`complexity`/`entry_points`/`has_native` from `size.rb`.
   * `advisories`: one row per (purl, advisory). Severity, CVSS, vulnerable range, first_patched_version, patched flag.
+  * `lookup_failures`: unresolved package, repository and owner lookups, with endpoint, status, reason and last attempt time.
   * `dependencies`: one row per (purl, dep). Requirement, dep's current latest, majors_behind, runtime/dev kind.
   * `dependents`: one row per (purl, rank). Top-N dependent packages by downloads, with description.
 
@@ -132,6 +162,7 @@ Some queries:
   * `out/remediation.csv`, `out/remediation.json`: every non-active package with `situation`, `remediation`, `alternative_purl`, `remediation_source`, `llm_confidence`, top dependent, code size and complexity.
   * `findings/<lang>.csv`: same columns as `remediation.csv`, one file per ecosystem alongside the writeup (e.g. `findings/ruby.csv` for rubygems).
   * `out/tag.csv`: review sheet from `tag.rb`; edit and reimport.
+  * `out/lookup-failures.csv`: unresolved lookups across the import, repository and owner collectors.
   * `out/<ecosystem>-bernies.csv`: per-ecosystem dead+dormant export from `export_ecosystem.rb`.
 
 ## First full run (Apr 2026)

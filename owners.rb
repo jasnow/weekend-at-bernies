@@ -5,15 +5,17 @@
 # repo_metadata.owner_record for free, then falls back to a per-owner fetch
 # from repos.ecosyste.ms for whatever is left. Cached under cache/owners.
 #
-# Usage: ruby owners.rb [LIMIT]   (LIMIT applies to the API fallback only)
+# Usage: ruby owners.rb [--refresh] [--failures FILE] [LIMIT]
 
 require "sqlite3"
 require "set"
 require "uri"
 require "json"
 require "fileutils"
+require "optparse"
 require_relative "http"
 require_relative "database"
+require_relative "lookup_failures"
 
 WORKDIR        = __dir__
 DB_PATH        = Bernies.database_path
@@ -21,13 +23,21 @@ PACKAGES_CACHE = File.join(WORKDIR, "cache", "packages")
 REPOS_CACHE    = File.join(WORKDIR, "cache", "repos")
 OWNERS_CACHE   = File.join(WORKDIR, "cache", "owners")
 CONN           = conn("https://repos.ecosyste.ms")
-LIMIT          = ARGV[0]&.to_i
+options = {}
+OptionParser.new do |parser|
+  parser.on("--refresh") { options[:refresh] = true }
+  parser.on("--failures FILE") { |path| options[:failures] = path }
+end.parse!
+REFRESH = !!options[:refresh]
+LIMIT = ARGV[0]&.to_i
 
 FileUtils.mkdir_p(OWNERS_CACHE)
+FileUtils.mkdir_p(REPOS_CACHE)
 
 db = SQLite3::Database.new(DB_PATH)
 db.busy_timeout = 5000
 db.results_as_hash = true
+failures = Bernies::LookupFailures.new(db, "owners")
 db.execute_batch <<~SQL
   CREATE TABLE IF NOT EXISTS owners (
     host                TEXT NOT NULL,
@@ -71,8 +81,8 @@ upsert = db.prepare <<~SQL
 SQL
 
 mark_missing = db.prepare(<<~SQL)
-  INSERT OR IGNORE INTO owners (host, login, owners_synced_at)
-  VALUES (?, ?, datetime('now'))
+  INSERT OR IGNORE INTO owners (host, login)
+  VALUES (?, ?)
 SQL
 
 def host_from_url(url)
@@ -95,9 +105,18 @@ def write_owner(upsert, host, login, rec)
   true
 end
 
+rows = db.execute(<<~SQL)
+  SELECT host, owner, MIN(repository_url) AS repository_url
+  FROM repos
+  WHERE owner IS NOT NULL AND repository_url IS NOT NULL
+  GROUP BY host, owner
+  ORDER BY (host='github.com') DESC, host, owner
+SQL
+owner_keys = rows.to_h { |r| [[r["host"].to_s.downcase, r["owner"].downcase], [r["host"], r["owner"]]] }
+
 # ---- pass 1: harvest owner_record from cached packages ----
 puts "scanning cache/packages for embedded owner_record..."
-files = Dir[File.join(PACKAGES_CACHE, "*.json")]
+files = REFRESH ? [] : Dir[File.join(PACKAGES_CACHE, "*.json")]
 seen = Set.new
 hit  = 0
 files.each_with_index do |f, i|
@@ -112,10 +131,14 @@ files.each_with_index do |f, i|
     host = host_from_url(rm.dig("host", "url"))
     login = rec["login"] || rm["owner"]
     next unless host && login
-    key = [host, login]
+    key = owner_keys[[host.downcase, login.downcase]]
+    next unless key
+    host, login = key
     next if seen.include?(key)
     seen.add(key)
+    next if db.get_first_value("SELECT 1 FROM owners WHERE host=? AND login=? AND kind IS NOT NULL AND owners_synced_at IS NOT NULL", key)
     write_owner(upsert, host, login, rec)
+    failures.clear("owner", "#{host}/#{login}")
     hit += 1
   end
   print "\r[#{i + 1}/#{files.size}] cache owners written: #{hit}"
@@ -128,15 +151,9 @@ synced = db
   .map { |r| [r["host"], r["login"]] }
   .to_set
 
-rows = db.execute(<<~SQL)
-  SELECT host, owner, MIN(repository_url) AS repository_url
-  FROM repos
-  WHERE owner IS NOT NULL AND repository_url IS NOT NULL
-  GROUP BY host, owner
-  ORDER BY (host='github.com') DESC, host, owner
-SQL
-
-todo = rows.reject { |r| synced.include?([r["host"], r["owner"]]) }
+todo = REFRESH ? rows : rows.reject { |r|
+  synced.include?([r["host"], r["owner"]]) && !failures.recorded?("owner", "#{r['host']}/#{r['owner']}")
+}
 todo = todo.first(LIMIT) if LIMIT
 
 puts "API fallback: #{todo.size} owners not in cache (#{synced.size} already filled)"
@@ -144,20 +161,25 @@ puts "API fallback: #{todo.size} owners not in cache (#{synced.size} already fil
 api_hit = api_miss = norepo = 0
 todo.each_with_index do |r, i|
   host, login = r["host"], r["owner"]
-  repo = cached_get(CONN, "/api/v1/repositories/lookup", { url: r["repository_url"] }, REPOS_CACHE)
-  if repo.nil? || repo["owner_url"].to_s.empty?
+  retrying = REFRESH || failures.recorded?("owner", "#{host}/#{login}")
+  result = cached_response(CONN, "/api/v1/repositories/lookup", { url: r["repository_url"] }, REPOS_CACHE, refresh: retrying)
+  repo = result.data
+  if !repo.is_a?(Hash) || repo["owner_url"].to_s.empty?
     norepo += 1
-    puts ; puts "norepo/miss: #{r["repository_url"]}"
+    result.reason ||= "missing_owner_url"
+    puts ; puts "norepo/miss: #{failures.record('owner', "#{host}/#{login}", result, repository_url: r['repository_url'])}"
     mark_missing.execute(host, login)
   else
     path = URI.parse(repo["owner_url"]).path
-    rec = cached_get(CONN, path, {}, OWNERS_CACHE)
-    if rec.nil?
+    result = cached_response(CONN, path, {}, OWNERS_CACHE, refresh: retrying)
+    rec = result.data
+    if !rec.is_a?(Hash) || rec["kind"].to_s.empty?
       api_miss += 1
-      puts ; puts "miss: #{rec}"
+      puts ; puts "miss: #{failures.record('owner', "#{host}/#{login}", result, repository_url: r['repository_url'])}"
       mark_missing.execute(host, login)
     else
       write_owner(upsert, host, login, rec)
+      failures.clear("owner", "#{host}/#{login}")
       api_hit += 1
     end
   end
@@ -169,3 +191,4 @@ puts
 populated = db.get_first_value("SELECT COUNT(*) FROM owners WHERE kind IS NOT NULL")
 unknown   = db.get_first_value("SELECT COUNT(*) FROM owners WHERE kind IS NULL")
 puts "owners table: #{populated} populated, #{unknown} unknown"
+Bernies::LookupFailures.export(db, options[:failures], collector: "owners") if options[:failures]

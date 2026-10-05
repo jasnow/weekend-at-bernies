@@ -10,12 +10,18 @@
 #
 # Usage: ruby situate.rb [--all]
 
+require_relative "database"
+
 require "sqlite3"
 require "time"
+require "optparse"
 
 WORKDIR = __dir__
-DB_PATH = File.join(WORKDIR, "bernies.db")
-ALL     = ARGV.include?("--all")
+DB_PATH = Bernies.database_path
+options = {}
+OptionParser.new { |parser| parser.on("--all") { options[:all] = true } }.parse!
+abort "Usage: ruby situate.rb [--all]" unless ARGV.empty?
+ALL = !!options[:all]
 
 INLINEABLE_LOC        = 300
 INLINEABLE_COMPLEXITY = 50
