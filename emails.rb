@@ -29,6 +29,7 @@ require "open3"
 require "fileutils"
 require "optparse"
 require_relative "http"
+require_relative "lookup_failures"
 
 WORKDIR          = __dir__
 DB_PATH          = Bernies.database_path
@@ -52,6 +53,7 @@ FREE_WEBMAIL = %w[
 ].to_set
 
 GITHUB_NOREPLY = /\.noreply\.github\.com\z/
+DomainFailure = Struct.new(:url, :status, :host_status, :resolved_url, :reason, keyword_init: true)
 
 FileUtils.mkdir_p(COMMITTERS_CACHE)
 FileUtils.mkdir_p(WHOIS_CACHE)
@@ -108,8 +110,10 @@ def dns_check(domain)
     mx = dns.getresources(domain, Resolv::DNS::Resource::IN::MX).to_a
   end
   { resolves: resolves || !mx.empty?, has_mx: !mx.empty?, mx_count: mx.size }
-rescue Resolv::ResolvError, Resolv::ResolvTimeout, IOError
-  nil
+rescue Resolv::ResolvTimeout
+  { reason: "dns_timeout" }
+rescue Resolv::ResolvError, IOError => e
+  { reason: "dns_error", detail: e.message }
 end
 
 def parse_whois(raw)
@@ -149,22 +153,21 @@ end
 
 def whois_check(domain)
   cache_file = File.join(WHOIS_CACHE, "#{Digest::SHA256.hexdigest(domain)[0, 32]}.txt")
-  raw =
-    if !REFRESH && File.exist?(cache_file) && !File.read(cache_file).start_with?("ERROR")
-      File.read(cache_file)
-    else
-      sleep WHOIS_DELAY
-      out, _err, status = Open3.capture3({ "LANG" => "C" }, "whois", domain)
-      if status.success? && !out.strip.empty?
-        File.write(cache_file, out)
-        out
-      else
-        "ERROR\n"
-      end
-    end
-  parse_whois(raw)
+  if !REFRESH && File.exist?(cache_file) && !File.read(cache_file).start_with?("ERROR")
+    return parse_whois(File.read(cache_file))
+  end
+
+  sleep WHOIS_DELAY
+  out, err, status = Open3.capture3({ "LANG" => "C" }, "whois", domain)
+  unless status.success? && !out.strip.empty?
+    reason = status.success? ? "whois_empty" : "whois_failed"
+    return { status: "error", reason: reason, detail: err.strip.lines.first&.strip }
+  end
+
+  File.write(cache_file, out)
+  parse_whois(out)
 rescue Errno::ENOENT
-  { status: "no_whois_tool", expires_at: nil, registrar: nil }
+  { status: "no_whois_tool", reason: "no_whois_tool" }
 end
 
 # ---------- pass 1: fetch committer emails ----------
@@ -222,7 +225,8 @@ already = db
   .map { |r| r["domain"] }
   .to_set
 
-todo_domains = REFRESH ? domains : domains.reject { |d| already.include?(d) }
+failures = Bernies::LookupFailures.new(db, "emails")
+todo_domains = REFRESH ? domains : domains.reject { |d| already.include?(d) && !failures.recorded?("domain", d) }
 puts "step 2: classify/check #{todo_domains.size} domains (#{already.size} done)"
 
 upsert = db.prepare <<~SQL
@@ -246,10 +250,13 @@ todo_domains.each_with_index do |domain, i|
   else
     dns   = dns_check(domain)
     whois = whois_check(domain)
-    if dns.nil? || %w[error no_whois_tool].include?(whois[:status])
-      puts ; puts "miss: #{domain}"
+    failed = dns[:reason] ? dns : whois[:reason] && whois
+    if failed
+      failures.record("domain", domain, DomainFailure.new(reason: failed[:reason]))
+      puts ; puts ["miss: #{domain}: #{failed[:reason]}", failed[:detail]].compact.join(": ")
       next
     end
+    failures.clear("domain", domain)
     upsert.execute(
       domain, kind,
       dns[:resolves] ? 1 : 0, dns[:has_mx] ? 1 : 0, dns[:mx_count],

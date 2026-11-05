@@ -140,7 +140,7 @@ Everything lands in `bernies.db` (sqlite, WAL mode):
   * `packages`: one row per critical package (purl). Registry, dependent counts, downloads, latest release, registry maintainers, dep-drift rollups, `top1_share`/`top5_share`/`transit_ratio`, `situation`/`remediation`/`alternative_purl`/`remediation_source`.
   * `repos`: one row per repository_url. Repo metadata, commit/issue stats, clone result, advisory rollups, bucket, signals, `code_loc`/`complexity`/`entry_points`/`has_native` from `size.rb`.
   * `advisories`: one row per (purl, advisory). Severity, CVSS, vulnerable range, first_patched_version, patched flag.
-  * `lookup_failures`: unresolved package, repository, owner, clone and size lookups, with endpoint, status, reason and last attempt time.
+  * `lookup_failures`: unresolved package, repository, owner, clone, size and email domain lookups, with endpoint, status, reason and last attempt time.
   * `dependencies`: one row per (purl, dep). Requirement, dep's current latest, majors_behind, runtime/dev kind.
   * `dependents`: one row per (purl, rank). Top-N dependent packages by downloads, with description.
 

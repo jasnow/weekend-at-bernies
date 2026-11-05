@@ -148,11 +148,17 @@ class CollectorRefreshTest < Minitest::Test
     row = @db.get_first_row("SELECT * FROM email_domains WHERE domain='example.test'")
     assert_equal "active", row["whois_status"]
     assert_equal 0, row["resolves"]
-    run_script("emails", ["--refresh", "1"], [response(urls[0], nil, 404)], commands: { "whois_failed" => true })
+    failure = "SELECT reason FROM lookup_failures WHERE collector='emails' AND kind='domain' AND identifier='example.test'"
+    output = run_script("emails", ["--refresh", "1"], [response(urls[0], nil, 404)], commands: { "whois_failed" => true })
+    assert_includes output, "miss: example.test: whois_failed"
+    assert_equal "whois_failed", @db.get_first_value(failure)
     assert_equal row, @db.get_first_row("SELECT * FROM email_domains WHERE domain='example.test'")
     assert_equal "new@example.test", @db.get_first_value("SELECT email FROM commit_emails WHERE login=?", [@owners[0]])
     run_script("emails", ["--refresh", "1"], [response(urls[0], { "emails" => ["new@example.test"] })], commands: fresh.merge("dns_failed" => true))
+    assert_equal "dns_timeout", @db.get_first_value(failure)
     assert_equal row, @db.get_first_row("SELECT * FROM email_domains WHERE domain='example.test'")
+    assert_includes run_script("emails", [], [], commands: fresh), "check 1 domains"
+    assert_nil @db.get_first_value(failure)
   end
 
   def dependency(name)
